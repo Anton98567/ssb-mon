@@ -10,12 +10,19 @@ set -euo pipefail
 
 # --- Настройки (при необходимости переопределить извне: SECRET=xxx bash install.sh)
 SSB_MON_PORT="${SSB_MON_PORT:-9090}"
-SECRET="${SECRET:-$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)}"
+# если clash_api уже сконфигурирован — оставляем его секрет, иначе генерируем
+if SECRET="${SECRET:-}"; then :; fi
+if [[ -z "${SECRET:-}" ]] && command -v jq >/dev/null; then
+    SECRET="$(jq -r '.experimental.clash_api.secret // empty' /etc/sing-box/config.json 2>/dev/null || true)"
+fi
+if [[ -z "${SECRET:-}" ]]; then
+    SECRET="$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)"
+fi
 INTERVAL="${SSB_MON_INTERVAL:-10}"
 INSTALL_DIR="/usr/local/bin"
 DATA_DIR="/var/lib/ssb-mon"
 SERVICE_NAME="ssb-mon"
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 
 # Репозиторий для скачивания ssb-mon.py при установке одной командой
 REPO_RAW="https://raw.githubusercontent.com/Anton98567/ssb-mon/main"
