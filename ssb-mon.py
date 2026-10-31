@@ -75,37 +75,25 @@ def api(ep):
 
 
 def read_first_json_chunk(r):
-    """Читаем байт за байтом, пока JSON-объект не закрылся (depth==0)."""
-    buf = b""
-    depth = 0
-    in_str = False
-    esc = False
+    """Читаем крупными блоками, пока JSON-объект не завершился (raw_decode).
+
+    Раньше читало по 1 байту с конкатенацией буфера на каждый байт — на busy-нодах
+    (большой /connections) это давало ~100% CPU."""
+    dec = json.JSONDecoder()
+    buf = ""
     while True:
-        chunk = r.read(1)
+        chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
         if not chunk:
             break
-        b = chunk[0]
-        if in_str:
-            buf += chunk
-            if esc:
-                esc = False
-            elif b == 0x5C:  # backslash
-                esc = True
-            elif b == 0x22:  # "
-                in_str = False
+        buf += chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else chunk
+        s = buf.lstrip()
+        if not s:
             continue
-        if b == 0x22:
-            in_str = True
-            buf += chunk
+        try:
+            obj, _ = dec.raw_decode(s)
+            return json.dumps(obj)
+        except ValueError:
             continue
-        buf += chunk
-        if b == 0x7B:  # {
-            depth += 1
-        elif b == 0x7D:  # }
-            depth -= 1
-            if depth == 0:
-                return buf
-
 
 def db_connect():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
