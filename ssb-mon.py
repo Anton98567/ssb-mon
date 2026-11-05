@@ -5,6 +5,15 @@
 снапшоты памяти/трафика/соединений в SQLite и читает box.log (INFO),
 извлекая события "[user] inbound connection to ..." для истории сессий.
 
+v2.1.0 (05.11.2026):
+  * ФИКС читателя лога: при обрезке файла (logrotate copytruncate) чтение
+    возобновляется с начала — раньше «слепота» длилась часами/днями;
+  * user_bytes: трафик в байтах ПО КАЖДОМУ ПОЛЬЗОВАТЕЛЮ (конфигу) —
+    корреляция по connection-id лога (user <-> source ip:port) и счётчикам
+    clash-api (sourceIP:sourcePort -> upload/download). mux не мешает:
+    mux-соединение логируется как "[user] inbound connection to sp.mux...".
+  * команда `ssb-mon bytes` — трафик по пользователям.
+
 Конфигурация через переменные окружения (парсится из CLI в приоритете):
   SSB_MON_API       API base, по умолчанию http://127.0.0.1:9090
   SSB_MON_SECRET    Bearer-секрет clash-api, по умолчанию пустой
@@ -12,7 +21,7 @@
   SSB_MON_LOG       путь к логу sing-box, по умолчанию /var/lib/sing-box/box.log
   SSB_MON_INTERVAL  период опроса, cек, по умолчанию 10
 
-CLI: ssb-mon <online|traffic|mem|sessions|users|history>
+CLI: ssb-mon <online|traffic|mem|sessions|users|history|bytes>
 Демон: ssb-mon daemon
 """
 
@@ -26,7 +35,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-_VERSION = "2.0.1"
+_VERSION = "2.1.0"
 
 ENV_FILE = "/etc/ssb-mon/env"
 
@@ -55,6 +64,10 @@ LOG_PATH = os.environ.get("SSB_MON_LOG", "/var/lib/sing-box/box.log")
 INTERVAL = float(os.environ.get("SSB_MON_INTERVAL", "10"))
 
 LOG_ENTRY = re.compile(r"\[([^\]]+)\] inbound (?:packet )?connection to (\S+):(\d+)")
+# строка открытия соединения: "INFO [124353 5ms] inbound/trojan[trojan-in]: inbound connection from 1.2.3.4:5678"
+LOG_FROM = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: inbound connection from (\S+):(\d+)")
+# строка пользователя: "... [124353 31ms] inbound/trojan[trojan-in]: [ORDER-x-yyy] inbound connection to host:443"
+LOG_USER = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: \[([^\]]+)\] inbound (?:packet )?connection to")
 
 # /memory и /traffic — стрим-эндпоинты: ответ не закрывается, каждый кадр —
 # отдельный JSON-объект подряд. Читаем один объект и рвём соединение.
@@ -129,12 +142,22 @@ def init_db(con):
         ts INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_users_log_user ON users_log(user);
+    CREATE TABLE IF NOT EXISTS user_bytes (
+        user TEXT PRIMARY KEY,
+        up INTEGER DEFAULT 0,
+        down INTEGER DEFAULT 0,
+        updated INTEGER
+    );
     """)
     con.commit()
 
 
 class LogWatcher:
-    """Читает box.log с конца, отдаёт новые строки за итерацию."""
+    """Читает box.log с конца, отдаёт новые строки за итерацию.
+
+    v2.1.0: обнаружение обрезки файла (logrotate copytruncate) — чтение
+    возобновляется с начала нового файла, а не «слепнет» до переполнения
+    старого смещения."""
 
     def __init__(self, path):
         self.path = path
@@ -149,6 +172,13 @@ class LogWatcher:
 
     def poll(self):
         try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return []
+        if size < self.offset:
+            # файл обрезан (ротация copytruncate) — читаем новый файл с начала
+            self.offset = 0
+        try:
             with open(self.path, "rb") as f:
                 f.seek(self.offset)
                 data = f.read()
@@ -162,13 +192,30 @@ class LogWatcher:
 
 
 def log_events(new_lines):
-    out = []
+    """События пользователей + связки connection-id -> (user, source).
+
+    Строки лога:
+      [124353 5ms]  ...: inbound connection from 1.2.3.4:5678          (id -> src)
+      [124353 31ms] ...: [ORDER-x-yyy] inbound connection to host:443  (id -> user)
+    Одинаковый id связывает источник с пользователем — это ключ корреляции
+    для user_bytes (mux не мешает: mux-соединение логируется с user)."""
+    out, id_user, id_src = [], {}, {}
     for ln in new_lines:
         m = LOG_ENTRY.search(ln)
         if m:
             user, host, port = m.groups()
             out.append({"user": user, "host": host, "port": port, "ts": int(time.time())})
-    return out
+        mu = LOG_USER.search(ln)
+        if mu:
+            id_user[mu.group(1)] = mu.group(2)
+        mf = LOG_FROM.search(ln)
+        if mf:
+            id_src[mf.group(1)] = (mf.group(2), mf.group(3))
+    pairs = {}
+    for cid, user in id_user.items():
+        if cid in id_src:
+            pairs[id_src[cid]] = user
+    return out, pairs
 
 
 def now_ts():
@@ -179,6 +226,8 @@ def main_daemon():
     con = db_connect()
     init_db(con)
     watcher = LogWatcher(LOG_PATH)
+    # src_user: (ip, port) -> user; conn_bytes: clash-id -> (up, down) для дельт
+    src_user, conn_bytes = {}, {}
     print(
         f"ssb-mon daemon v{_VERSION} start: api={API} db={DB_PATH} log={LOG_PATH} interval={INTERVAL:.0f}s",
         flush=True,
@@ -204,11 +253,48 @@ def main_daemon():
                 (now_ts(), mem_inuse, len(clist), total_up, total_down),
             )
 
-        for ev in log_events(watcher.poll()):
+        events, pairs = log_events(watcher.poll())
+        for ev in events:
             con.execute(
                 "INSERT INTO users_log(user,event,ts) VALUES(?,?,?)",
                 (ev["user"], f"inbound {ev['host']}:{ev['port']}", ev["ts"]),
             )
+        src_user.update(pairs)
+
+        # --- user_bytes: дельты по активным соединениям -> владельцу (user) ---
+        if clist:
+            deltas = {}
+            seen = set()
+            for c in clist:
+                meta = c.get("metadata", {})
+                key = (meta.get("sourceIP", ""), meta.get("sourcePort", ""))
+                seen.add(c.get("id"))
+                user = src_user.get(key)
+                if not user:
+                    continue
+                up, down = c.get("upload", 0), c.get("download", 0)
+                pu, pd = conn_bytes.get(c.get("id"), (0, 0))
+                if up > pu or down > pd:
+                    du, dd = up - pu, down - pd
+                    u = deltas.setdefault(user, [0, 0])
+                    u[0] += max(0, du)
+                    u[1] += max(0, dd)
+                conn_bytes[c.get("id")] = (up, down)
+            ts = now_ts()
+            for user, (du, dd) in deltas.items():
+                con.execute(
+                    "INSERT INTO user_bytes(user,up,down,updated) VALUES(?,?,?,?) "
+                    "ON CONFLICT(user) DO UPDATE SET up=up+excluded.up, down=down+excluded.down, "
+                    "updated=excluded.updated",
+                    (user, du, dd, ts),
+                )
+            # чистим закрывшиеся соединения (их финальные дельты ≤ INTERVAL — терпимо)
+            for cid in list(conn_bytes):
+                if cid not in seen:
+                    del conn_bytes[cid]
+            # память словаря src_user ограничиваем: записи старше суток не нужны
+            if len(src_user) > 20000:
+                src_user.clear()
         con.commit()
 
         time.sleep(max(0, INTERVAL - (time.time() - t0)))
@@ -262,6 +348,24 @@ def cmd_online():
         except Exception:
             start_f = st or "-"
         print(f"{ip:<18} {len(d['conns']):>5} {fmt_size(d['up']):>10} {fmt_size(d['down']):>10} {start_f}")
+    return 0
+
+
+def cmd_bytes():
+    """Накопленный трафик по пользователям (конфигам) — таблица user_bytes."""
+    con = db_connect()
+    try:
+        rows = con.execute(
+            "SELECT user, up, down, updated FROM user_bytes ORDER BY up+down DESC LIMIT 40"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    if not rows:
+        print("Данных о трафике пользователей ещё нет (нужны активные подключения).")
+        return 0
+    print(f"{'Пользователь':<34} {'Отдано':>10} {'Принято':>10} {'Обновлено':<21}")
+    for user, up, down, upd in rows:
+        print(f"{user:<34} {fmt_size(up):>10} {fmt_size(down):>10} {fmt_dt(upd):<21}")
     return 0
 
 
@@ -368,9 +472,9 @@ def cmd_history():
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("daemon", "online", "traffic", "mem", "sessions", "users", "history"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("daemon", "online", "traffic", "mem", "sessions", "users", "history", "bytes"):
         print(f"ssb-mon v{_VERSION}")
-        print("usage: ssb-mon <daemon|online|traffic|mem|sessions|users|history>")
+        print("usage: ssb-mon <daemon|online|traffic|mem|sessions|users|history|bytes>")
         return 1
     cmd = sys.argv[1]
     if cmd == "daemon":
@@ -387,6 +491,8 @@ def main():
         return cmd_users()
     elif cmd == "history":
         return cmd_history()
+    elif cmd == "bytes":
+        return cmd_bytes()
 
 
 if __name__ == "__main__":
