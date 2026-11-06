@@ -35,7 +35,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-_VERSION = "2.1.1"
+_VERSION = "2.2.0"
 
 ENV_FILE = "/etc/ssb-mon/env"
 
@@ -149,6 +149,13 @@ def init_db(con):
         down INTEGER DEFAULT 0,
         updated INTEGER
     );
+    CREATE TABLE IF NOT EXISTS src_user (
+        ip TEXT,
+        port TEXT,
+        user TEXT,
+        updated INTEGER,
+        PRIMARY KEY (ip, port)
+    );
     """)
     con.commit()
 
@@ -229,6 +236,7 @@ def main_daemon():
     watcher = LogWatcher(LOG_PATH)
     # src_user: (ip, port) -> user; conn_bytes: clash-id -> (up, down) для дельт
     src_user, conn_bytes = {}, {}
+    tick = 0
     print(
         f"ssb-mon daemon v{_VERSION} start: api={API} db={DB_PATH} log={LOG_PATH} interval={INTERVAL:.0f}s",
         flush=True,
@@ -261,6 +269,16 @@ def main_daemon():
                 (ev["user"], f"inbound {ev['host']}:{ev['port']}", ev["ts"]),
             )
         src_user.update(pairs)
+        # сохраняем связку источник->конфиг в БД: её читает ssb-mon online (CLI)
+        if pairs:
+            con.executemany(
+                "INSERT OR REPLACE INTO src_user(ip,port,user,updated) VALUES(?,?,?,?)",
+                [(ip, port, user, now_ts()) for (ip, port), user in pairs.items()],
+            )
+        # чистка старых связок ~раз в час (30 дней — покрывает долгоживущие mux-сессии)
+        tick += 1
+        if tick % 360 == 0:
+            con.execute("DELETE FROM src_user WHERE updated < ?", (now_ts() - 30 * 86400,))
 
         # --- user_bytes: дельты по активным соединениям -> владельцу (user) ---
         if clist:
@@ -328,27 +346,43 @@ def cmd_online():
     if not clist:
         print("Нет активных подключений.")
         return 0
-    by_ip = {}
+    # источник -> конфиг (пишет демон из лога); если не найден — показываем IP
+    src_user = {}
+    try:
+        con = db_connect()
+        for ip, port, user in con.execute("SELECT ip, port, user FROM src_user"):
+            src_user[(ip, str(port))] = user
+        con.close()
+    except sqlite3.OperationalError:
+        pass
+    by_who = {}
     for c in clist:
         m = c.get("metadata", {})
         ip = m.get("sourceIP", "?")
-        d = by_ip.setdefault(ip, {"conns": [], "up": 0, "down": 0, "start": None})
-        d["conns"].append(c)
+        port = str(m.get("sourcePort", ""))
+        who = src_user.get((ip, port)) or ip
+        d = by_who.setdefault(who, {"conns": 0, "up": 0, "down": 0, "start": None, "ips": set()})
+        d["conns"] += 1
+        d["ips"].add(ip)
         d["up"] += c.get("upload", 0)
         d["down"] += c.get("download", 0)
         st = c.get("start")
         if st and (d["start"] is None or st < d["start"]):
             d["start"] = st
 
-    print(f"{'IP клиента':<18} {'Соед.':>5} {'Uplink':>10} {'Downlink':>10} {'Начало (UTC)'}")
-    for ip, d in sorted(by_ip.items()):
+    print(f"{'Конфиг / IP':<30} {'Соед.':>5} {'Uplink':>10} {'Downlink':>10} {'Начало (UTC)'}")
+    for who, d in sorted(by_who.items()):
         st = d["start"]
         try:
             start_s = datetime.strptime(st, "%Y-%m-%dT%H:%M:%S.%f%z" if "." in st else "%Y-%m-%dT%H:%M:%S%z")
             start_f = start_s.strftime("%H:%M:%S")
         except Exception:
             start_f = st or "-"
-        print(f"{ip:<18} {len(d['conns']):>5} {fmt_size(d['up']):>10} {fmt_size(d['down']):>10} {start_f}")
+        # первый столбец — строго ОДИН токен (так парсит ssb-online-sort);
+        # реальный IP — хвостовой колонкой, парсер его игнорирует
+        ips = ",".join(sorted(d["ips"]))
+        tail = "" if who in d["ips"] else f"  [{ips}]"
+        print(f"{who:<30} {d['conns']:>5} {fmt_size(d['up']):>10} {fmt_size(d['down']):>10} {start_f}{tail}")
     return 0
 
 
