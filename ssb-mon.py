@@ -35,7 +35,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-_VERSION = "2.1.0"
+_VERSION = "2.1.1"
 
 ENV_FILE = "/etc/ssb-mon/env"
 
@@ -65,7 +65,8 @@ INTERVAL = float(os.environ.get("SSB_MON_INTERVAL", "10"))
 
 LOG_ENTRY = re.compile(r"\[([^\]]+)\] inbound (?:packet )?connection to (\S+):(\d+)")
 # строка открытия соединения: "INFO [124353 5ms] inbound/trojan[trojan-in]: inbound connection from 1.2.3.4:5678"
-LOG_FROM = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: inbound connection from (\S+):(\d+)")
+# naive пишет "[user] inbound connection from", trojan — без префикса: (?:\[[^\]]+\] )?
+LOG_FROM = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: (?:\[[^\]]+\] )?inbound connection from (\S+):(\d+)")
 # строка пользователя: "... [124353 31ms] inbound/trojan[trojan-in]: [ORDER-x-yyy] inbound connection to host:443"
 LOG_USER = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: \[([^\]]+)\] inbound (?:packet )?connection to")
 
