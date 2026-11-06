@@ -35,7 +35,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-_VERSION = "2.2.1"
+_VERSION = "2.2.2"
 
 ENV_FILE = "/etc/ssb-mon/env"
 
@@ -81,11 +81,18 @@ def api(ep):
         headers={"Authorization": f"Bearer {SECRET}"} if SECRET else {},
     )
     with urllib.request.urlopen(req, timeout=8) as r:
-        obj = json.loads(read_first_json_chunk(r))
-        if ep == "/memory" and obj.get("inuse", 0) == 0:
-            # первый кадр стрима может быть нулевым — дочитываем живой
-            obj = json.loads(read_first_json_chunk(r))
-        return obj
+        if ep in STREAM_ENDPOINTS:
+            # стрим: читаем первый JSON-кадр
+            obj = read_first_json_chunk(r)
+            if ep == "/memory" and obj.get("inuse", 0) == 0:
+                # первый кадр стрима может быть нулевым — дочитываем живой
+                obj = read_first_json_chunk(r)
+            return obj
+        # обычный endpoint (/connections): ОДНО чтение + ОДИН парсинг.
+        # НЕ использовать read_first_json_chunk: на busy-нодах ответ десятки МБ,
+        # а поблочный raw_decode с повторным парсингом буфера = O(n²) = 100% CPU
+        # (прецедент in1, v2.2.1). json.loads сам справится с полным ответом.
+        return json.loads(r.read())
 
 
 def read_first_json_chunk(r):
@@ -105,7 +112,7 @@ def read_first_json_chunk(r):
             continue
         try:
             obj, _ = dec.raw_decode(s)
-            return json.dumps(obj)
+            return obj
         except ValueError:
             continue
 
