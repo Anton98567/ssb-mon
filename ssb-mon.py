@@ -35,7 +35,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-_VERSION = "2.2.0"
+_VERSION = "2.2.1"
 
 ENV_FILE = "/etc/ssb-mon/env"
 
@@ -230,6 +230,33 @@ def now_ts():
     return int(time.time())
 
 
+def prescan_pairs(path, tail_bytes=None):
+    """Стартовый скан лога: восстановить связки источник->конфиг для
+    соединений, открытых ДО старта демона (иначе ssb-mon online показывает их IP).
+    По умолчанию читает ВЕСЬ файл (logrotate держит box.log ≤100МБ) — это покрывает
+    все живые соединения, включая долгоживущие mux-сессии. Читает батчами строк —
+    память ограничена; пары from/to соседние, в батч попадают вместе."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if tail_bytes and size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()  # возможная обрезанная первая строка — пропускаем
+            pairs, batch = {}, []
+            for raw in f:
+                batch.append(raw.decode("utf-8", errors="replace"))
+                if len(batch) >= 50000:
+                    _, p = log_events(batch)
+                    pairs.update(p)
+                    batch = []
+            if batch:
+                _, p = log_events(batch)
+                pairs.update(p)
+        return pairs
+    except OSError:
+        return {}
+
+
 def main_daemon():
     con = db_connect()
     init_db(con)
@@ -237,6 +264,15 @@ def main_daemon():
     # src_user: (ip, port) -> user; conn_bytes: clash-id -> (up, down) для дельт
     src_user, conn_bytes = {}, {}
     tick = 0
+    # стартовый скан лога: восстановить имена конфигов для уже открытых соединений
+    pre = prescan_pairs(LOG_PATH)
+    if pre:
+        src_user.update(pre)
+        con.executemany(
+            "INSERT OR REPLACE INTO src_user(ip,port,user,updated) VALUES(?,?,?,?)",
+            [(ip, port, user, now_ts()) for (ip, port), user in pre.items()],
+        )
+        con.commit()
     print(
         f"ssb-mon daemon v{_VERSION} start: api={API} db={DB_PATH} log={LOG_PATH} interval={INTERVAL:.0f}s",
         flush=True,
@@ -311,8 +347,9 @@ def main_daemon():
             for cid in list(conn_bytes):
                 if cid not in seen:
                     del conn_bytes[cid]
-            # память словаря src_user ограничиваем: записи старше суток не нужны
-            if len(src_user) > 20000:
+            # память словаря src_user ограничиваем (порог высокий: prescan кладёт
+            # связки всех живых соединений; чистка = потеря имён для user_bytes)
+            if len(src_user) > 200000:
                 src_user.clear()
         con.commit()
 
