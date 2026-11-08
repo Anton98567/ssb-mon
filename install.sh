@@ -27,14 +27,18 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
 # Репозиторий для скачивания ssb-mon.py при установке одной командой
 REPO_RAW="https://raw.githubusercontent.com/Anton98567/ssb-mon/main"
 
-CONFIG_PATH="/etc/sing-box/config.json"
+# поддержка mbox (Схема B: sing-box-форк с mieru, enfein/mbox): /opt/mbox/bin/mbox + /etc/mbox/config.json
+BIN="sing-box"; SERVICE="sing-box"; CONFIG_PATH="/etc/sing-box/config.json"
+if ! command -v sing-box >/dev/null 2>&1 && [[ -x /opt/mbox/bin/mbox && -f /etc/mbox/config.json ]]; then
+    BIN="/opt/mbox/bin/mbox"; SERVICE="mbox"; CONFIG_PATH="/etc/mbox/config.json"
+fi
 
 log() { echo -e "\033[1;36m[ssb-mon]\033[0m $*"; }
 err() { echo -e "\033[1;31m[ssb-mon][ERROR]\033[0m $*" >&2; }
 
 [[ $EUID -eq 0 ]] || { err "Запусти от root (sudo bash install.sh)"; exit 1; }
 
-command -v sing-box >/dev/null || { err "sing-box не установлен — сначала поставь Secret-Sing-Box"; exit 1; }
+command -v "$BIN" >/dev/null 2>&1 || [[ -x $BIN ]] || { err "$BIN не установлен — сначала поставь Secret-Sing-Box (или mbox для Схемы B)"; exit 1; }
 [[ -f "$CONFIG_PATH" ]] || { err "Нет $CONFIG_PATH — конфиг SSB не найден"; exit 1; }
 command -v python3 >/dev/null || { err "python3 не установлен"; exit 1; }
 
@@ -80,11 +84,11 @@ with open(path, "w") as f:
 print("config updated" if changed else "config already ok")
 PYEOF
 
-sing-box check -c "$CONFIG_PATH" || { err "sing-box check провалился — конфиг повреждён, откат"; cp "$CONFIG_PATH.bak.ssb-mon" "$CONFIG_PATH"; exit 1; }
+"$BIN" check -c "$CONFIG_PATH" || { err "sing-box check провалился — конфиг повреждён, откат"; cp "$CONFIG_PATH.bak.ssb-mon" "$CONFIG_PATH"; exit 1; }
 log "sing-box check: OK"
 
-systemctl restart sing-box
-log "sing-box перезапущен"
+systemctl restart "$SERVICE"
+log "$SERVICE перезапущен"
 
 log "Устанавливаю $INSTALL_DIR/ssb-mon"
 install -m 0755 "$SRC_PY" "$INSTALL_DIR/ssb-mon"
@@ -107,8 +111,8 @@ log "Пишу systemd-юнит $SERVICE_NAME.service"
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=SSB Monitor (clash-api + box.log watcher)
-After=network.target sing-box.service
-Requires=sing-box.service
+After=network.target ${SERVICE}.service
+Requires=${SERVICE}.service
 
 [Service]
 Type=simple

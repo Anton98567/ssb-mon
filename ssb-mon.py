@@ -63,12 +63,14 @@ DB_PATH = os.environ.get("SSB_MON_DB", "/var/lib/ssb-mon/state.db")
 LOG_PATH = os.environ.get("SSB_MON_LOG", "/var/lib/sing-box/box.log")
 INTERVAL = float(os.environ.get("SSB_MON_INTERVAL", "10"))
 
-LOG_ENTRY = re.compile(r"\[([^\]]+)\] inbound (?:packet )?connection to (\S+):(\d+)")
+LOG_ENTRY = re.compile(r"\[([^\]]+)\] inbound (?:packet |TCP |UDP )?connection(?: to (\S+):(\d+))?")
 # строка открытия соединения: "INFO [124353 5ms] inbound/trojan[trojan-in]: inbound connection from 1.2.3.4:5678"
 # naive пишет "[user] inbound connection from", trojan — без префикса: (?:\[[^\]]+\] )?
-LOG_FROM = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: (?:\[[^\]]+\] )?inbound connection from (\S+):(\d+)")
+# mbox/mieru: "inbound TCP connection from [::ffff:1.2.3.4]:5678" (TCP/UDP словом, IPv6-mapped)
+LOG_FROM = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: (?:\[[^\]]+\] )?inbound (?:TCP |UDP )?connection from (\S+):(\d+)")
 # строка пользователя: "... [124353 31ms] inbound/trojan[trojan-in]: [ORDER-x-yyy] inbound connection to host:443"
-LOG_USER = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: \[([^\]]+)\] inbound (?:packet )?connection to")
+# mbox/mieru: "[ORDER-x-yyy] inbound TCP connection" (без "to host:port")
+LOG_USER = re.compile(r"\[(\d+)[^\]]*\] inbound[^:]*: \[([^\]]+)\] inbound (?:packet |TCP |UDP )?connection")
 
 # /memory и /traffic — стрим-эндпоинты: ответ не закрывается, каждый кадр —
 # отдельный JSON-объект подряд. Читаем один объект и рвём соединение.
@@ -219,13 +221,15 @@ def log_events(new_lines):
         m = LOG_ENTRY.search(ln)
         if m:
             user, host, port = m.groups()
-            out.append({"user": user, "host": host, "port": port, "ts": int(time.time())})
+            out.append({"user": user, "host": host or "", "port": port or "", "ts": int(time.time())})
         mu = LOG_USER.search(ln)
         if mu:
             id_user[mu.group(1)] = mu.group(2)
         mf = LOG_FROM.search(ln)
         if mf:
-            id_src[mf.group(1)] = (mf.group(2), mf.group(3))
+            # mbox/mieru пишет источник как [::ffff:1.2.3.4] — нормализуем к виду clash-api
+            src = mf.group(2).strip("[]").replace("::ffff:", "")
+            id_src[mf.group(1)] = (src, mf.group(3))
     pairs = {}
     for cid, user in id_user.items():
         if cid in id_src:
@@ -329,7 +333,10 @@ def main_daemon():
             seen = set()
             for c in clist:
                 meta = c.get("metadata", {})
-                key = (meta.get("sourceIP", ""), meta.get("sourcePort", ""))
+                # clash-api отдаёт sourceIP как "::ffff:1.2.3.4" — нормализуем
+                # к тому же виду, что и LOG_FROM (strip [] и ::ffff:)
+                sip = str(meta.get("sourceIP", "")).strip("[]").replace("::ffff:", "")
+                key = (sip, str(meta.get("sourcePort", "")))
                 seen.add(c.get("id"))
                 user = src_user.get(key)
                 if not user:
