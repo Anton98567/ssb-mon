@@ -112,7 +112,7 @@ cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=SSB Monitor (clash-api + box.log watcher)
 After=network.target ${SERVICE}.service
-Requires=${SERVICE}.service
+Wants=${SERVICE}.service
 
 [Service]
 Type=simple
