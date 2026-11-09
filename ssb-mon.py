@@ -326,6 +326,14 @@ def main_daemon():
         tick += 1
         if tick % 360 == 0:
             con.execute("DELETE FROM src_user WHERE updated < ?", (now_ts() - 30 * 86400,))
+            # users_log/sessions росли бесконечно (сотни МБ на busy-ноде) — держим 7 дней
+            # (кабинету/статистике нужно максимум 24ч; история в CLI — неделя)
+            cut7 = now_ts() - 7 * 86400
+            con.execute("DELETE FROM users_log WHERE ts < ?", (cut7,))
+            try:
+                con.execute("DELETE FROM sessions WHERE ts < ?", (cut7,))
+            except Exception:
+                pass
 
         # --- user_bytes: дельты по активным соединениям -> владельцу (user) ---
         if clist:
